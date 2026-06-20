@@ -6,6 +6,13 @@ A bold, single-page React app for learning Japanese as a beginner, powered entir
 The AI runs through a tiny Express proxy, so the React frontend stays a clean single
 component (`src/App.jsx`) that just calls `window.claude.complete(prompt)`.
 
+## Screenshot
+
+The **Chat** tab — speak or type in Japanese; the tutor replies in Japanese with romaji and
+English, with role-play scenarios, a daily streak, and a words-learned counter.
+
+![Chat tab](docs/chat.png)
+
 ## Features
 
 Four tabs:
