@@ -736,11 +736,19 @@ function VocabTab({ learned, markLearned, unmarkLearned }) {
     setLoading(true);
     setError('');
     try {
+      // Ask for an OBJECT that wraps the array — the proxy runs the model in
+      // JSON mode, which reliably returns a single object but tends to collapse
+      // a bare top-level array down to one item.
       const prompt = `Generate a beginner Japanese vocabulary deck of EXACTLY 10 words about the topic "${t}".
-Respond ONLY with a JSON array (no markdown) of 10 objects, each exactly:
-{ "japanese": "word in Japanese (kana, simple)", "romaji": "romaji", "english": "English meaning" }`;
+Respond ONLY with a JSON object (no markdown) of this exact shape:
+{ "cards": [ { "japanese": "word in kana (simple)", "romaji": "romaji", "english": "English meaning" } ] }
+The "cards" array MUST contain exactly 10 items.`;
       const res = await askClaudeJSON(prompt);
-      const arr = Array.isArray(res) ? res : res.cards || res.deck || [];
+      // Accept a bare array, a known wrapper key, or any array-valued property.
+      const arr = Array.isArray(res)
+        ? res
+        : res.cards || res.deck || res.words || res.vocabulary ||
+          Object.values(res).find((v) => Array.isArray(v)) || [];
       const mapped = arr
         .filter((c) => c && c.japanese)
         .map((c) => [c.japanese, c.romaji || '', c.english || '']);
