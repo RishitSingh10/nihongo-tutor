@@ -41,6 +41,32 @@ function parseLooseJSON(text) {
   }
 }
 
+// Progressive parser for the streaming chat format. The tutor replies with
+// labelled lines (JAPANESE: / ROMAJI: / ENGLISH: / CORRECTION:). This tolerates
+// partial buffers mid-stream and stray markdown, so fields fill in as they arrive.
+function parseDelimited(buf) {
+  const out = { japanese: '', romaji: '', english: '', correction: '' };
+  const map = { JAPANESE: 'japanese', ROMAJI: 'romaji', ENGLISH: 'english', CORRECTION: 'correction' };
+  let cur = null;
+  for (const line of buf.split('\n')) {
+    const m = line.match(/^[\s*#>\-]*\b(JAPANESE|ROMAJI|ENGLISH|CORRECTION)\b\s*[:：]\s?(.*)$/i);
+    if (m) {
+      cur = map[m[1].toUpperCase()];
+      out[cur] = m[2];
+    } else if (cur) {
+      out[cur] += (out[cur] ? '\n' : '') + line;
+    }
+  }
+  // Correction is a single logical block; drop any trailing chatter the model
+  // appends after a blank line, and treat "NONE" as no correction.
+  out.correction = out.correction.split(/\n\s*\n/)[0].trim();
+  if (out.correction.toUpperCase() === 'NONE') out.correction = '';
+  out.japanese = out.japanese.trim();
+  out.romaji = out.romaji.trim();
+  out.english = out.english.trim();
+  return out;
+}
+
 // ----------------------------------------------------------------------------
 // Text-to-speech (Japanese)
 // ----------------------------------------------------------------------------
@@ -76,6 +102,28 @@ function saveProgress(p) {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(p));
   } catch (_) {}
 }
+
+// Lossless cache for model-generated content: a repeated topic/translation
+// returns the identical result instantly instead of re-running inference.
+const CACHE_PREFIX = 'nihongo_cache_v1:';
+function cacheGet(key) {
+  try {
+    const v = localStorage.getItem(CACHE_PREFIX + key);
+    return v ? JSON.parse(v) : null;
+  } catch (_) {
+    return null;
+  }
+}
+function cacheSet(key, val) {
+  try {
+    localStorage.setItem(CACHE_PREFIX + key, JSON.stringify(val));
+  } catch (_) {}
+}
+
+// Cap how many prior turns we feed back to the model. Beginner tutoring only
+// needs recent context, and an unbounded transcript makes prompt-eval slower
+// every turn. ~8 messages ≈ 4 exchanges.
+const MAX_HISTORY = 8;
 
 function todayStr() {
   return new Date().toISOString().slice(0, 10);
@@ -368,6 +416,7 @@ function ChatTab({ markLearned }) {
   const buildPrompt = (history, userText) => {
     const sc = SCENARIOS.find((s) => s.id === scenario);
     const convo = history
+      .slice(-MAX_HISTORY)
       .map((m) => `${m.role === 'user' ? 'Student' : 'Tutor'}: ${m.japanese || m.english}`)
       .join('\n');
     return `You are a warm, encouraging Japanese tutor for an absolute BEGINNER.
@@ -388,29 +437,85 @@ Respond ONLY with a single JSON object, no markdown, with these exact keys:
 }`;
   };
 
+  // Streaming prompt: same content as the JSON version, but as labelled lines
+  // that stream naturally (Japanese first, then romaji, English, correction).
+  const buildStreamPrompt = (history, userText) => {
+    const sc = SCENARIOS.find((s) => s.id === scenario);
+    const convo = history
+      .slice(-MAX_HISTORY)
+      .map((m) => `${m.role === 'user' ? 'Student' : 'Tutor'}: ${m.japanese || m.english}`)
+      .join('\n');
+    return `You are a warm, encouraging Japanese tutor for an absolute BEGINNER.
+Scenario: ${sc.desc}
+Keep your Japanese SIMPLE (beginner level, short sentences, mostly hiragana/katakana with very common kanji).
+
+Conversation so far:
+${convo || '(none yet)'}
+
+The student just said (they may have made mistakes, or written in English): "${userText}"
+
+Reply in EXACTLY this format — four labelled lines, in this order, and nothing else:
+JAPANESE: <your reply in Japanese>
+ROMAJI: <romaji transliteration of your Japanese reply>
+ENGLISH: <English translation of your reply>
+CORRECTION: <if the student's Japanese had mistakes, gently explain the correction in English (corrected Japanese + why); otherwise write NONE>`;
+  };
+
   const send = async (text) => {
     const userText = (text ?? input).trim();
     if (!userText || loading) return;
     setError('');
     setInput('');
     const userMsg = { role: 'user', japanese: userText, romaji: '', english: '' };
-    const history = [...messages, userMsg];
-    setMessages(history);
+    const priorMessages = messages;
+    setMessages((m) => [...m, userMsg]);
     setLoading(true);
+
+    const canStream = typeof window !== 'undefined' && window.claude && window.claude.stream;
     try {
-      const res = await askClaudeJSON(buildPrompt(messages, userText));
-      const tutorMsg = {
-        role: 'tutor',
-        japanese: res.japanese || '',
-        romaji: res.romaji || '',
-        english: res.english || '',
-      };
-      setMessages((m) => [...m, tutorMsg]);
-      setCorrection(res.correction && res.correction.trim() ? res.correction.trim() : null);
-      if (tutorMsg.japanese) setTimeout(() => speakJapanese(tutorMsg.japanese), 150);
+      if (canStream) {
+        // Insert a live placeholder bubble and fill it as tokens arrive.
+        setMessages((m) => [...m, { role: 'tutor', japanese: '', romaji: '', english: '', streaming: true }]);
+        const apply = (parsed) => {
+          setMessages((m) => {
+            const copy = m.slice();
+            const last = copy[copy.length - 1];
+            if (last && last.role === 'tutor') {
+              copy[copy.length - 1] = { ...last, japanese: parsed.japanese, romaji: parsed.romaji, english: parsed.english };
+            }
+            return copy;
+          });
+          setCorrection(parsed.correction && parsed.correction.trim() ? parsed.correction.trim() : null);
+        };
+        // Stop as soon as the four labelled lines are complete (the CORRECTION
+        // line has ended) — the reply is fully in hand, so don't let the model
+        // ramble on. Aborting cancels generation upstream at Ollama too.
+        const controller = new AbortController();
+        const onChunk = (sofar) => {
+          apply(parseDelimited(sofar));
+          if (/CORRECTION\s*[:：][^\n]*\n/i.test(sofar)) controller.abort();
+        };
+        const full = await window.claude.stream(buildStreamPrompt(priorMessages, userText), onChunk, controller.signal);
+        const finalParsed = parseDelimited(full);
+        setMessages((m) => {
+          const copy = m.slice();
+          const last = copy[copy.length - 1];
+          if (last && last.role === 'tutor') copy[copy.length - 1] = { ...last, ...finalParsed, streaming: false };
+          return copy;
+        });
+        if (finalParsed.japanese) setTimeout(() => speakJapanese(finalParsed.japanese), 150);
+      } else {
+        // Fallback: non-streaming JSON path.
+        const res = await askClaudeJSON(buildPrompt(priorMessages, userText));
+        const tutorMsg = { role: 'tutor', japanese: res.japanese || '', romaji: res.romaji || '', english: res.english || '' };
+        setMessages((m) => [...m, tutorMsg]);
+        setCorrection(res.correction && res.correction.trim() ? res.correction.trim() : null);
+        if (tutorMsg.japanese) setTimeout(() => speakJapanese(tutorMsg.japanese), 150);
+      }
     } catch (e) {
+      // Drop any empty streaming placeholder, surface the error, keep the student's message.
+      setMessages((m) => m.filter((msg) => !(msg.role === 'tutor' && msg.streaming && !msg.japanese)));
       setError(e.message || 'Something went wrong calling the tutor.');
-      // Keep the student's message visible so they can retry.
     } finally {
       setLoading(false);
     }
@@ -474,7 +579,9 @@ Respond ONLY with a single JSON object, no markdown, with these exact keys:
             <div key={i} className="flex justify-start">
               <div className="max-w-[85%] rounded-2xl rounded-bl-sm bg-neutral-800 px-4 py-3">
                 <div className="flex items-start justify-between gap-2">
-                  <div className="text-lg font-medium leading-snug">{m.japanese}</div>
+                  <div className="text-lg font-medium leading-snug">
+                    {m.japanese || (m.streaming ? <span className="animate-pulse text-neutral-500">▋</span> : '')}
+                  </div>
                   <button
                     onClick={() => speakJapanese(m.japanese)}
                     className="shrink-0 rounded-full bg-neutral-700 px-2 py-1 text-xs hover:bg-neutral-600"
@@ -487,7 +594,7 @@ Respond ONLY with a single JSON object, no markdown, with these exact keys:
             </div>
           )
         )}
-        {loading && (
+        {loading && !(messages.length > 0 && messages[messages.length - 1].role === 'tutor') && (
           <div className="flex justify-start">
             <div className="rounded-2xl rounded-bl-sm bg-neutral-800 px-4 py-3 text-neutral-400">
               <span className="inline-flex gap-1">
@@ -617,6 +724,15 @@ function VocabTab({ learned, markLearned, unmarkLearned }) {
   const generate = async () => {
     const t = topic.trim();
     if (!t || loading) return;
+    const cacheKey = 'vocab:' + t.toLowerCase();
+    const cached = cacheGet(cacheKey);
+    if (cached && cached.length) {
+      setCustomCards(cached);
+      setDeckName(`✨ ${t}`);
+      reset();
+      setError('');
+      return;
+    }
     setLoading(true);
     setError('');
     try {
@@ -630,6 +746,7 @@ Respond ONLY with a JSON array (no markdown) of 10 objects, each exactly:
         .map((c) => [c.japanese, c.romaji || '', c.english || '']);
       if (mapped.length === 0) throw new Error('No cards generated.');
       setCustomCards(mapped);
+      cacheSet(cacheKey, mapped);
       setDeckName(`✨ ${t}`);
       reset();
     } catch (e) {
@@ -741,6 +858,13 @@ function TranslateTab() {
   const translate = async () => {
     const t = text.trim();
     if (!t || loading) return;
+    const cacheKey = 'tr:' + t;
+    const cached = cacheGet(cacheKey);
+    if (cached) {
+      setResult(cached);
+      setError('');
+      return;
+    }
     setLoading(true);
     setError('');
     setResult(null);
@@ -762,6 +886,7 @@ Respond ONLY with a JSON object (no markdown):
 Break the Japanese sentence into its meaningful words/particles in order.`;
       const res = await askClaudeJSON(prompt);
       setResult(res);
+      cacheSet(cacheKey, res);
     } catch (e) {
       setError(e.message || 'Translation failed.');
     } finally {

@@ -39,9 +39,20 @@ Vite dev server (:5173)  ──proxy /api──▶  Express proxy (:8787)
                                           Ollama (:11434)  ──▶  local model (qwen2.5 / gemma3)
 ```
 
-- **`src/App.jsx`** — the entire UI (unchanged from the original single-file artifact).
-- **`src/main.jsx`** — defines the `window.claude.complete` shim that posts to the proxy.
-- **`server/index.js`** — Express proxy that forwards prompts to Ollama and forces JSON output.
+- **`src/App.jsx`** — the entire UI. The **Chat** tab streams (`window.claude.stream`) for token-by-token replies; Vocab/Translate use the JSON path.
+- **`src/main.jsx`** — defines the `window.claude.complete` (JSON) and `window.claude.stream` (chat) shims that post to the proxy.
+- **`server/index.js`** — Express proxy: `/api/complete` (forced-JSON) and `/api/stream` (streamed text), warms + pins the model on boot.
+
+## Performance
+
+Tuned for CPU-only machines, without lowering output quality:
+
+- **Streaming chat** — the tutor's reply appears token-by-token (time-to-first-token ≈ 100 ms instead of waiting seconds for the whole reply). The stream is **cut off as soon as the four reply lines are complete**, so the model can't ramble — and the cancel propagates upstream to stop Ollama generating.
+- **Warm + pinned model** — the proxy loads the model into RAM on startup (`keep_alive: -1`), so your *first* message doesn't pay the cold-start penalty and the model is never evicted while idle.
+- **Local cache** — repeated vocab topics and translations are served instantly from `localStorage` (identical result, no re-inference).
+- **Bounded chat history** — only the last few turns are sent back to the model, so prompt-eval time stays flat as a conversation grows.
+
+> Generation speed itself (tokens/sec) is bound by your CPU/GPU — for a big jump, use a smaller model (`qwen2.5:3b`) or a machine with a dedicated GPU.
 
 ## Requirements
 
@@ -88,8 +99,9 @@ To switch models, change `OLLAMA_MODEL` and restart `npm run start`.
 ## Notes
 
 - **Browser support:** microphone speech recognition works in **Chrome / Edge**, not Firefox.
-- **Speed:** on a CPU-only machine the first AI request loads the model into RAM and can take
-  ~30–60s; later requests are faster. The Alphabet tab and preset decks need no model and are instant.
+- **Speed:** the proxy warms the model on startup, so your first message is already fast; chat
+  replies stream in token-by-token. See [Performance](#performance). The Alphabet tab and preset
+  decks need no model and are instant.
 - **Privacy:** everything runs locally. Nothing is sent to any third-party API.
 
 ## License
